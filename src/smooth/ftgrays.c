@@ -4,7 +4,7 @@
  *
  *   A new `perfect' anti-aliasing renderer (body).
  *
- * Copyright (C) 2000-2024 by
+ * Copyright (C) 2000-2023 by
  * David Turner, Robert Wilhelm, and Werner Lemberg.
  *
  * This file is part of the FreeType project, and may only be used,
@@ -997,12 +997,49 @@ typedef ptrdiff_t  FT_PtrDist;
 #endif
 
   /*
-   * For now, the code that uses DDA to render conic curves requires
-   * `FT_Int64` to be defined.  See for example
-   *    https://gitlab.freedesktop.org/freetype/freetype/-/issues/1071.
+   * Benchmarking shows that using DDA to flatten the quadratic Bézier arcs
+   * is slightly faster in the following cases:
+   *
+   *   - When the host CPU is 64-bit.
+   *   - When SSE2 SIMD registers and instructions are available (even on
+   *     x86).
+   *
+   * For other cases, using binary splits is actually slightly faster.
    */
+#if ( defined( __SSE2__ )                          ||   \
+      defined( __x86_64__ )                        ||   \
+      defined( _M_AMD64 )                          ||   \
+      ( defined( _M_IX86_FP ) && _M_IX86_FP >= 2 ) ) && \
+    !defined( __VMS )
+#  define FT_SSE2 1
+#else
+#  define FT_SSE2 0
+#endif
 
-#ifdef FT_INT64
+#if FT_SSE2                || \
+    defined( __aarch64__ ) || \
+    defined( _M_ARM64 )
+#  define BEZIER_USE_DDA  1
+#else
+#  define BEZIER_USE_DDA  0
+#endif
+
+  /*
+   * For now, the code that depends on `BEZIER_USE_DDA` requires `FT_Int64`
+   * to be defined.  If `FT_INT64` is not defined, meaning there is no
+   * 64-bit type available, disable it to avoid compilation errors.  See for
+   * example https://gitlab.freedesktop.org/freetype/freetype/-/issues/1071.
+   */
+#if !defined( FT_INT64 )
+#  undef BEZIER_USE_DDA
+#  define BEZIER_USE_DDA  0
+#endif
+
+#if BEZIER_USE_DDA
+
+#if FT_SSE2
+#  include <emmintrin.h>
+#endif
 
 #define LEFT_SHIFT( a, b )  (FT_Int64)( (FT_UInt64)(a) << (b) )
 
@@ -1058,17 +1095,16 @@ typedef ptrdiff_t  FT_PtrDist;
       return;
     }
 
-    /* We can calculate the number of necessary segments because    */
+    /* We can calculate the number of necessary bisections because  */
     /* each bisection predictably reduces deviation exactly 4-fold. */
     /* Even 32-bit deviation would vanish after 16 bisections.      */
-    shift = 16;
+    shift = 0;
     do
     {
-      dx >>= 2;
-      shift--;
+      dx   >>= 2;
+      shift += 1;
 
     } while ( dx > ONE_PIXEL / 4 );
-    count = 0x10000U >> shift;
 
     /*
      * The (P0,P1,P2) arc equation, for t in [0,1] range:
@@ -1114,19 +1150,75 @@ typedef ptrdiff_t  FT_PtrDist;
      *             = (B << (33 - N)) + (A << (32 - 2*N))
      */
 
-    rx = LEFT_SHIFT( ax, shift + shift );
-    ry = LEFT_SHIFT( ay, shift + shift );
+#if FT_SSE2
+    /* Experience shows that for small shift values, */
+    /* SSE2 is actually slower.                      */
+    if ( shift > 2 )
+    {
+      union
+      {
+        struct { FT_Int64  ax, ay, bx, by; }  i;
+        struct { __m128i  a, b; }  vec;
 
-    qx = LEFT_SHIFT( bx, shift + 17 ) + rx;
-    qy = LEFT_SHIFT( by, shift + 17 ) + ry;
+      } u;
 
-    rx *= 2;
-    ry *= 2;
+      union
+      {
+        struct { FT_Int32  px_lo, px_hi, py_lo, py_hi; }  i;
+        __m128i  vec;
+
+      } v;
+
+      __m128i  a, b;
+      __m128i  r, q, q2;
+      __m128i  p;
+
+
+      u.i.ax = ax;
+      u.i.ay = ay;
+      u.i.bx = bx;
+      u.i.by = by;
+
+      a = _mm_load_si128( &u.vec.a );
+      b = _mm_load_si128( &u.vec.b );
+
+      r  = _mm_slli_epi64( a, 33 - 2 * shift );
+      q  = _mm_slli_epi64( b, 33 - shift );
+      q2 = _mm_slli_epi64( a, 32 - 2 * shift );
+
+      q = _mm_add_epi64( q2, q );
+
+      v.i.px_lo = 0;
+      v.i.px_hi = p0.x;
+      v.i.py_lo = 0;
+      v.i.py_hi = p0.y;
+
+      p = _mm_load_si128( &v.vec );
+
+      for ( count = 1U << shift; count > 0; count-- )
+      {
+        p = _mm_add_epi64( p, q );
+        q = _mm_add_epi64( q, r );
+
+        _mm_store_si128( &v.vec, p );
+
+        gray_render_line( RAS_VAR_ v.i.px_hi, v.i.py_hi );
+      }
+
+      return;
+    }
+#endif  /* FT_SSE2 */
+
+    rx = LEFT_SHIFT( ax, 33 - 2 * shift );
+    ry = LEFT_SHIFT( ay, 33 - 2 * shift );
+
+    qx = LEFT_SHIFT( bx, 33 - shift ) + LEFT_SHIFT( ax, 32 - 2 * shift );
+    qy = LEFT_SHIFT( by, 33 - shift ) + LEFT_SHIFT( ay, 32 - 2 * shift );
 
     px = LEFT_SHIFT( p0.x, 32 );
     py = LEFT_SHIFT( p0.y, 32 );
 
-    do
+    for ( count = 1U << shift; count > 0; count-- )
     {
       px += qx;
       py += qy;
@@ -1135,10 +1227,10 @@ typedef ptrdiff_t  FT_PtrDist;
 
       gray_render_line( RAS_VAR_ (FT_Pos)( px >> 32 ),
                                  (FT_Pos)( py >> 32 ) );
-    } while ( --count );
+    }
   }
 
-#else  /* !FT_INT64 */
+#else  /* !BEZIER_USE_DDA */
 
   /*
    * Note that multiple attempts to speed up the function below
@@ -1232,7 +1324,7 @@ typedef ptrdiff_t  FT_PtrDist;
     } while ( --draw );
   }
 
-#endif  /* !FT_INT64 */
+#endif  /* !BEZIER_USE_DDA */
 
 
   /*
@@ -1391,6 +1483,139 @@ typedef ptrdiff_t  FT_PtrDist;
 
     gray_render_cubic( RAS_VAR_ control1, control2, to );
     return 0;
+  }
+
+
+  static void
+  gray_sweep( RAS_ARG )
+  {
+    int  fill = ( ras.outline.flags & FT_OUTLINE_EVEN_ODD_FILL ) ? 0x100
+                                                                 : INT_MIN;
+    int  coverage;
+    int  y;
+
+
+    for ( y = ras.min_ey; y < ras.max_ey; y++ )
+    {
+      PCell   cell  = ras.ycells[y - ras.min_ey];
+      TCoord  x     = ras.min_ex;
+      TArea   cover = 0;
+
+      unsigned char*  line = ras.target.origin - ras.target.pitch * y;
+
+
+      for ( ; cell != ras.cell_null; cell = cell->next )
+      {
+        TArea  area;
+
+
+        if ( cover != 0 && cell->x > x )
+        {
+          FT_FILL_RULE( coverage, cover, fill );
+          FT_GRAY_SET( line + x, coverage, cell->x - x );
+        }
+
+        cover += (TArea)cell->cover * ( ONE_PIXEL * 2 );
+        area   = cover - cell->area;
+
+        if ( area != 0 && cell->x >= ras.min_ex )
+        {
+          FT_FILL_RULE( coverage, area, fill );
+          line[cell->x] = (unsigned char)coverage;
+        }
+
+        x = cell->x + 1;
+      }
+
+      if ( cover != 0 )  /* only if cropped */
+      {
+        FT_FILL_RULE( coverage, cover, fill );
+        FT_GRAY_SET( line + x, coverage, ras.max_ex - x );
+      }
+    }
+  }
+
+
+  static void
+  gray_sweep_direct( RAS_ARG )
+  {
+    int  fill = ( ras.outline.flags & FT_OUTLINE_EVEN_ODD_FILL ) ? 0x100
+                                                                 : INT_MIN;
+    int  coverage;
+    int  y;
+
+    FT_Span  span[FT_MAX_GRAY_SPANS];
+    int      n = 0;
+
+
+    for ( y = ras.min_ey; y < ras.max_ey; y++ )
+    {
+      PCell   cell  = ras.ycells[y - ras.min_ey];
+      TCoord  x     = ras.min_ex;
+      TArea   cover = 0;
+
+
+      for ( ; cell != ras.cell_null; cell = cell->next )
+      {
+        TArea  area;
+
+
+        if ( cover != 0 && cell->x > x )
+        {
+          FT_FILL_RULE( coverage, cover, fill );
+
+          span[n].coverage = (unsigned char)coverage;
+          span[n].x        = (short)x;
+          span[n].len      = (unsigned short)( cell->x - x );
+
+          if ( ++n == FT_MAX_GRAY_SPANS )
+          {
+            /* flush the span buffer and reset the count */
+            ras.render_span( y, n, span, ras.render_span_data );
+            n = 0;
+          }
+        }
+
+        cover += (TArea)cell->cover * ( ONE_PIXEL * 2 );
+        area   = cover - cell->area;
+
+        if ( area != 0 && cell->x >= ras.min_ex )
+        {
+          FT_FILL_RULE( coverage, area, fill );
+
+          span[n].coverage = (unsigned char)coverage;
+          span[n].x        = (short)cell->x;
+          span[n].len      = 1;
+
+          if ( ++n == FT_MAX_GRAY_SPANS )
+          {
+            /* flush the span buffer and reset the count */
+            ras.render_span( y, n, span, ras.render_span_data );
+            n = 0;
+          }
+        }
+
+        x = cell->x + 1;
+      }
+
+      if ( cover != 0 )  /* only if cropped */
+      {
+        FT_FILL_RULE( coverage, cover, fill );
+
+        span[n].coverage = (unsigned char)coverage;
+        span[n].x        = (short)x;
+        span[n].len      = (unsigned short)( ras.max_ex - x );
+
+        ++n;
+      }
+
+      if ( n )
+      {
+        /* flush the span buffer and reset the count */
+        ras.render_span( y, n, span, ras.render_span_data );
+        n = 0;
+      }
+    }
   }
 
 
@@ -1709,7 +1934,7 @@ typedef ptrdiff_t  FT_PtrDist;
       if ( continued )
         FT_Trace_Enable();
 
-      FT_TRACE7(( "band [%d..%d]: %td cell%s remaining\n",
+      FT_TRACE7(( "band [%d..%d]: %td cell%s remaining/\n",
                   ras.min_ey,
                   ras.max_ey,
                   ras.cell_null - ras.cell_free,
@@ -1724,139 +1949,6 @@ typedef ptrdiff_t  FT_PtrDist;
     }
 
     return error;
-  }
-
-
-  static void
-  gray_sweep( RAS_ARG )
-  {
-    int  fill = ( ras.outline.flags & FT_OUTLINE_EVEN_ODD_FILL ) ? 0x100
-                                                                 : INT_MIN;
-    int  coverage;
-    int  y;
-
-
-    for ( y = ras.min_ey; y < ras.max_ey; y++ )
-    {
-      PCell   cell  = ras.ycells[y - ras.min_ey];
-      TCoord  x     = ras.min_ex;
-      TArea   cover = 0;
-
-      unsigned char*  line = ras.target.origin - ras.target.pitch * y;
-
-
-      for ( ; cell != ras.cell_null; cell = cell->next )
-      {
-        TArea  area;
-
-
-        if ( cover != 0 && cell->x > x )
-        {
-          FT_FILL_RULE( coverage, cover, fill );
-          FT_GRAY_SET( line + x, coverage, cell->x - x );
-        }
-
-        cover += (TArea)cell->cover * ( ONE_PIXEL * 2 );
-        area   = cover - cell->area;
-
-        if ( area != 0 && cell->x >= ras.min_ex )
-        {
-          FT_FILL_RULE( coverage, area, fill );
-          line[cell->x] = (unsigned char)coverage;
-        }
-
-        x = cell->x + 1;
-      }
-
-      if ( cover != 0 )  /* only if cropped */
-      {
-        FT_FILL_RULE( coverage, cover, fill );
-        FT_GRAY_SET( line + x, coverage, ras.max_ex - x );
-      }
-    }
-  }
-
-
-  static void
-  gray_sweep_direct( RAS_ARG )
-  {
-    int  fill = ( ras.outline.flags & FT_OUTLINE_EVEN_ODD_FILL ) ? 0x100
-                                                                 : INT_MIN;
-    int  coverage;
-    int  y;
-
-    FT_Span  span[FT_MAX_GRAY_SPANS];
-    int      n = 0;
-
-
-    for ( y = ras.min_ey; y < ras.max_ey; y++ )
-    {
-      PCell   cell  = ras.ycells[y - ras.min_ey];
-      TCoord  x     = ras.min_ex;
-      TArea   cover = 0;
-
-
-      for ( ; cell != ras.cell_null; cell = cell->next )
-      {
-        TArea  area;
-
-
-        if ( cover != 0 && cell->x > x )
-        {
-          FT_FILL_RULE( coverage, cover, fill );
-
-          span[n].coverage = (unsigned char)coverage;
-          span[n].x        = (short)x;
-          span[n].len      = (unsigned short)( cell->x - x );
-
-          if ( ++n == FT_MAX_GRAY_SPANS )
-          {
-            /* flush the span buffer and reset the count */
-            ras.render_span( y, n, span, ras.render_span_data );
-            n = 0;
-          }
-        }
-
-        cover += (TArea)cell->cover * ( ONE_PIXEL * 2 );
-        area   = cover - cell->area;
-
-        if ( area != 0 && cell->x >= ras.min_ex )
-        {
-          FT_FILL_RULE( coverage, area, fill );
-
-          span[n].coverage = (unsigned char)coverage;
-          span[n].x        = (short)cell->x;
-          span[n].len      = 1;
-
-          if ( ++n == FT_MAX_GRAY_SPANS )
-          {
-            /* flush the span buffer and reset the count */
-            ras.render_span( y, n, span, ras.render_span_data );
-            n = 0;
-          }
-        }
-
-        x = cell->x + 1;
-      }
-
-      if ( cover != 0 )  /* only if cropped */
-      {
-        FT_FILL_RULE( coverage, cover, fill );
-
-        span[n].coverage = (unsigned char)coverage;
-        span[n].x        = (short)x;
-        span[n].len      = (unsigned short)( ras.max_ex - x );
-
-        ++n;
-      }
-
-      if ( n )
-      {
-        /* flush the span buffer and reset the count */
-        ras.render_span( y, n, span, ras.render_span_data );
-        n = 0;
-      }
-    }
   }
 
 

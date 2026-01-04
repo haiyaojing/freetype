@@ -4,7 +4,7 @@
  *
  *   Auto-fitter hinting routines for latin writing system (body).
  *
- * Copyright (C) 2003-2024 by
+ * Copyright (C) 2003-2023 by
  * David Turner, Robert Wilhelm, and Werner Lemberg.
  *
  * This file is part of the FreeType project, and may only be used,
@@ -981,7 +981,7 @@
       /* `ref' and `shoot' values of two blue zones must not overlap */
 
       FT_UInt       i;
-      AF_LatinBlue  blue_sorted[AF_BLUE_STRINGSET_MAX_LEN];
+      AF_LatinBlue  blue_sorted[AF_BLUE_STRINGSET_MAX_LEN + 2];
 
 
       for ( i = 0; i < axis->blue_count; i++ )
